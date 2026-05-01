@@ -7717,6 +7717,7 @@ def cmd_profile(args):
     from hermes_cli.profiles import (
         list_profiles,
         create_profile,
+        apply_l7_research_profile,
         delete_profile,
         seed_profile_skills,
         set_active_profile,
@@ -7799,6 +7800,7 @@ def cmd_profile(args):
         name = args.profile_name
         clone = getattr(args, "clone", False)
         clone_all = getattr(args, "clone_all", False)
+        l7_research = getattr(args, "l7_research", False)
         no_alias = getattr(args, "no_alias", False)
 
         try:
@@ -7821,6 +7823,17 @@ def cmd_profile(args):
                     print(f"Full copy from {source_label}.")
                 else:
                     print(f"Cloned config, .env, SOUL.md, and skills from {source_label}.")
+
+            if l7_research:
+                apply_l7_research_profile(profile_dir)
+                print(
+                    "Applied L7 research preset: tool loop guardrail warnings "
+                    "and hard stops disabled; command approvals unchanged."
+                )
+                print(
+                    "Research use only: deploy only in an air-gapped environment "
+                    "with external logging and hardware kill authority."
+                )
 
             # Auto-clone Honcho config for the new profile (only with --clone/--clone-all)
             if clone or clone_all:
@@ -10077,6 +10090,14 @@ Examples:
         "--clone-from",
         metavar="SOURCE",
         help="Source profile to clone from (default: active)",
+    )
+    profile_create.add_argument(
+        "--l7-research",
+        action="store_true",
+        help=(
+            "Apply the air-gapped L7 research preset: disable tool loop "
+            "guardrails while leaving command approvals unchanged"
+        ),
     )
     profile_create.add_argument(
         "--no-alias", action="store_true", help="Skip wrapper script creation"

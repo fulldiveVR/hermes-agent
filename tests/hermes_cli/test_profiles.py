@@ -13,11 +13,13 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
+import yaml
 
 from hermes_cli.profiles import (
     validate_profile_name,
     get_profile_dir,
     create_profile,
+    apply_l7_research_profile,
     delete_profile,
     list_profiles,
     set_active_profile,
@@ -213,6 +215,45 @@ class TestCreateProfile:
         assert not (profile_dir / ".env").exists()
         # SOUL.md is always seeded with the default even when clone source lacks it
         assert (profile_dir / "SOUL.md").exists()
+
+    def test_l7_research_profile_writes_config_and_context(self, profile_env):
+        profile_dir = create_profile("l7lab", no_alias=True)
+
+        apply_l7_research_profile(profile_dir)
+
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert config["tool_loop_guardrails"]["warnings_enabled"] is False
+        assert config["tool_loop_guardrails"]["hard_stop_enabled"] is False
+        assert "approvals" not in config
+        assert "Autonomy level: L7" in (profile_dir / "SOUL.md").read_text()
+        assert "Command approval gates remain active" in (
+            profile_dir / "workspace" / ".hermes.md"
+        ).read_text()
+
+    def test_l7_research_profile_preserves_existing_approval_config(self, profile_env):
+        profile_dir = create_profile("l7clone", no_alias=True)
+        (profile_dir / "config.yaml").write_text(
+            "\n".join(
+                [
+                    "approvals:",
+                    "  mode: on",
+                    "tool_loop_guardrails:",
+                    "  warnings_enabled: true",
+                    "  warn_after:",
+                    "    exact_failure: 7",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        apply_l7_research_profile(profile_dir)
+
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert config["approvals"]["mode"] == "on"
+        assert config["tool_loop_guardrails"]["warnings_enabled"] is False
+        assert config["tool_loop_guardrails"]["hard_stop_enabled"] is False
+        assert config["tool_loop_guardrails"]["warn_after"]["exact_failure"] == 7
 
 
 # ===================================================================

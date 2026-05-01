@@ -54,6 +54,19 @@ Copies **everything** — config, API keys, personality, all memories, full sess
 hermes profile create work --clone --clone-from coder
 ```
 
+### L7 research profile
+
+```bash
+hermes profile create l7-lab --l7-research
+```
+
+Creates an isolated profile for air-gapped L7 adversarial evaluation. The preset
+sets `tool_loop_guardrails.warnings_enabled: false` and
+`tool_loop_guardrails.hard_stop_enabled: false`, writes L7 framing to `SOUL.md`,
+and creates `workspace/.hermes.md` for experiment context. It does not write or
+change the `approvals` section, so command approval gates keep their existing
+or default behavior.
+
 :::tip Honcho memory + profiles
 When Honcho is enabled, `--clone` automatically creates a dedicated AI peer for the new profile while sharing the same user workspace. Each profile builds its own observations and identity. See [Honcho -- Multi-agent / Profiles](./features/memory-providers.md#honcho) for details.
 :::

@@ -79,6 +79,7 @@ Creates a new profile.
 | `--clone` | Copy `config.yaml`, `.env`, and `SOUL.md` from the current profile. |
 | `--clone-all` | Copy everything (config, memories, skills, sessions, state) from the current profile. |
 | `--clone-from <profile>` | Clone from a specific profile instead of the current one. Used with `--clone` or `--clone-all`. |
+| `--l7-research` | Apply the air-gapped L7 research preset: disable tool loop guardrail warnings and hard stops while leaving command approvals unchanged. |
 | `--no-alias` | Skip wrapper script creation. |
 
 Creating a profile does **not** make that profile directory the default project/workspace directory for terminal commands. If you want a profile to start in a specific project, set `terminal.cwd` in that profile's `config.yaml`.
@@ -97,6 +98,9 @@ hermes profile create backup --clone-all
 
 # Clone config from a specific profile
 hermes profile create work2 --clone --clone-from work
+
+# Create an isolated L7 adversarial-evaluation profile
+hermes profile create l7-lab --l7-research
 ```
 
 ## `hermes profile delete`
