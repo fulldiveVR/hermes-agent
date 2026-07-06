@@ -1588,6 +1588,17 @@ from gateway.restart import (
     parse_restart_drain_timeout,
 )
 
+# Extra slack added on top of the old gateway's drain window before the
+# incoming --replace gateway escalates to SIGKILL. Covers shutdown-notify
+# sends, adapter disconnect and session-DB flush that run after the drain.
+_REPLACE_KILL_WAIT_HEADROOM = 10.0
+# Hard upper bound so a wedged old process can never make the incoming
+# gateway wait forever.
+_REPLACE_KILL_WAIT_CAP = 300.0
+# Upper bound on the pre-drain shutdown-notify broadcast so slow/wedged
+# adapter sends can't starve the drain + resume-marker step.
+_SHUTDOWN_NOTIFY_MAX_SECONDS = 15.0
+
 
 from gateway.whatsapp_identity import (
     canonical_whatsapp_identifier as _canonical_whatsapp_identifier,  # noqa: F401
@@ -6380,7 +6391,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
-            await self._notify_active_sessions_of_shutdown()
+            # Time-bound the broadcast: a slow/wedged adapter send must not
+            # consume the shutdown budget and starve the drain +
+            # mark_resume_pending step below (which is what makes a
+            # force-interrupted in-flight reply recoverable on next start).
+            _notify_budget = min(
+                _SHUTDOWN_NOTIFY_MAX_SECONDS, max(1.0, self._restart_drain_timeout)
+            )
+            try:
+                await asyncio.wait_for(
+                    self._notify_active_sessions_of_shutdown(),
+                    timeout=_notify_budget,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Shutdown notification sends exceeded %.1fs budget; "
+                    "proceeding to drain.",
+                    _notify_budget,
+                )
+            except Exception as _e:
+                logger.debug("Shutdown notification error: %s", _e)
             logger.info(
                 "Shutdown phase: notify_active_sessions done at +%.2fs",
                 _phase_elapsed(),
@@ -17039,6 +17069,25 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _replace_kill_wait_seconds() -> float:
+    """How long the incoming ``--replace`` gateway waits for the old gateway
+    to exit gracefully before escalating to SIGKILL.
+
+    The old gateway may spend up to its full ``restart_drain_timeout``
+    draining in-flight turns (and then flushing the reply / disconnecting
+    adapters). Killing it after a fixed ~10s hard-kills any reply that
+    takes longer than that mid-generation — and outbound replies are a
+    single in-memory POST, so a hard kill loses them permanently. Align
+    the wait with the old gateway's drain window plus headroom, capped so
+    a wedged process can't stall the takeover forever.
+    """
+    try:
+        drain = GatewayRunner._load_restart_drain_timeout()
+    except Exception:
+        drain = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    return min(max(drain, 0.0) + _REPLACE_KILL_WAIT_HEADROOM, _REPLACE_KILL_WAIT_CAP)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -17101,18 +17150,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except Exception:
                     pass
                 return False
-            # Wait up to 10 seconds for the old process to exit.
+            # Give the old process its full graceful-drain window (plus
+            # headroom) to exit before force-killing, so an in-flight reply
+            # that takes longer than ~10s to flush isn't hard-killed and
+            # lost. Bounded by _REPLACE_KILL_WAIT_CAP.
             # ``os.kill(pid, 0)`` on Windows is NOT a no-op — use the
             # handle-based existence check instead.
             from gateway.status import _pid_exists
             old_gateway_exited = False
-            for _ in range(20):
+            _replace_wait = _replace_kill_wait_seconds()
+            _replace_wait_iters = max(1, int(round(_replace_wait / 0.5)))
+            for _ in range(_replace_wait_iters):
                 if not _pid_exists(existing_pid):
                     old_gateway_exited = True
                     break  # Process is gone
                 time.sleep(0.5)
             else:
-                # Still alive after 10s — force kill
+                # Still alive after the drain window — force kill
                 logger.warning(
                     "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
                     existing_pid,
