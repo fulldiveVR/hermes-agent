@@ -748,6 +748,54 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
 
 
+def mark_job_started(job_id: str) -> bool:
+    """Persist that a claimed job has begun executing.
+
+    This is written before agent execution so an abrupt process termination
+    cannot leave an advanced schedule paired with a stale successful status.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                job["state"] = "running"
+                job["last_run_at"] = _hermes_now().isoformat()
+                job["last_status"] = "running"
+                job["last_error"] = None
+                save_jobs(jobs)
+                return True
+    logger.warning("mark_job_started: job_id %s not found, skipping save", job_id)
+    return False
+
+
+def claim_job_run(job_id: str) -> bool:
+    """Atomically claim a due job, persist running state, and advance repeats.
+
+    The schedule and visible execution state must be written together: if the
+    process dies after this returns, operators see an interrupted running job
+    rather than an advanced schedule paired with a stale successful status.
+    """
+    with _jobs_file_lock:
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            now = _hermes_now().isoformat()
+            kind = job.get("schedule", {}).get("kind")
+            if kind in ("cron", "interval"):
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+            job["state"] = "running"
+            job["last_run_at"] = now
+            job["last_status"] = "running"
+            job["last_error"] = None
+            save_jobs(jobs)
+            return True
+    logger.warning("claim_job_run: job_id %s not found, skipping save", job_id)
+    return False
+
+
 def advance_next_run(job_id: str) -> bool:
     """Preemptively advance next_run_at for a recurring job before execution.
 

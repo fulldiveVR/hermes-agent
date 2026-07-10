@@ -20,6 +20,8 @@ from cron.jobs import (
     resume_job,
     remove_job,
     mark_job_run,
+    mark_job_started,
+    claim_job_run,
     advance_next_run,
     get_due_jobs,
     save_job_output,
@@ -301,6 +303,32 @@ class TestPauseResumeJob:
 
 
 class TestMarkJobRun:
+    def test_started_state_replaces_stale_success_without_changing_schedule(self, tmp_cron_dir):
+        job = create_job(prompt="Long task", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+        before = get_job(job["id"])
+
+        assert mark_job_started(job["id"]) is True
+        running = get_job(job["id"])
+        assert running["state"] == "running"
+        assert running["last_status"] == "running"
+        assert running["last_error"] is None
+        assert running["last_run_at"] is not None
+        assert running["next_run_at"] == before["next_run_at"]
+
+    def test_claim_atomically_marks_running_and_advances_recurring_schedule(self, tmp_cron_dir):
+        job = create_job(prompt="Long task", schedule="every 1h")
+        mark_job_run(job["id"], success=True)
+        before = get_job(job["id"])
+
+        assert claim_job_run(job["id"]) is True
+        claimed = get_job(job["id"])
+        assert claimed["state"] == "running"
+        assert claimed["last_status"] == "running"
+        assert claimed["last_error"] is None
+        assert claimed["last_run_at"] is not None
+        assert claimed["next_run_at"] != before["next_run_at"]
+
     def test_increments_completed(self, tmp_cron_dir):
         job = create_job(prompt="Test", schedule="every 1h")
         mark_job_run(job["id"], success=True)
