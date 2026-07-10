@@ -203,7 +203,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
+from cron.jobs import (
+    claim_job_run,
+    get_due_jobs,
+    mark_job_run,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2155,13 +2160,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         if verbose:
             logger.info("%s - %s job(s) due", _hermes_now().strftime('%H:%M:%S'), len(due_jobs))
 
-        # Advance next_run_at for all recurring jobs FIRST, under the file lock,
-        # before any execution begins.  This preserves at-most-once semantics.
-        # For parallel jobs that are already running, advance_next_run keeps
-        # bumping next_run_at forward so the grace window never expires.
-        # mark_job_run() overwrites next_run_at on completion.
+        # Claim every due job before queueing any worker. The claim atomically
+        # advances recurring schedules and persists visible running state, so
+        # a crash cannot leave an advanced schedule paired with stale success.
         for job in due_jobs:
-            advance_next_run(job["id"])
+            claim_job_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -2195,7 +2198,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            from gateway.activity import begin_activity, end_activity
+            activity_token = begin_activity("cron", job.get("id"))
+            try:
+                return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            finally:
+                end_activity(activity_token)
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —

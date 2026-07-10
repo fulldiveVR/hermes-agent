@@ -1104,6 +1104,7 @@ class APIServerAdapter(BasePlatformAdapter):
         /proc access.  No authentication required.
         """
         from gateway.status import read_runtime_status
+        from gateway.activity import active_count
 
         runtime = read_runtime_status() or {}
         return web.json_response({
@@ -1112,7 +1113,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "version": _hermes_version(),
             "gateway_state": runtime.get("gateway_state"),
             "platforms": runtime.get("platforms", {}),
-            "active_agents": runtime.get("active_agents", 0),
+            "active_agents": active_count(),
             "exit_reason": runtime.get("exit_reason"),
             "updated_at": runtime.get("updated_at"),
             "pid": os.getpid(),
@@ -3821,6 +3822,8 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _run_and_close():
+            from gateway.activity import begin_activity, end_activity
+            activity_token = begin_activity("api_run", run_id)
             try:
                 self._set_run_status(run_id, "running")
                 agent = self._create_agent(
@@ -3976,6 +3979,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     unregister_gateway_notify(approval_session_key)
                 except Exception:
                     pass
+                end_activity(activity_token)
                 # Sentinel: signal SSE stream to close
                 try:
                     q.put_nowait(None)

@@ -574,7 +574,7 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }):
+        }), patch("gateway.activity.active_count", return_value=2):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
