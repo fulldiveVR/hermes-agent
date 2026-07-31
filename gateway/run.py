@@ -282,6 +282,23 @@ def _home_target_env_var(platform_name: str) -> str:
     )
 
 
+def _home_prompt_exempt(platform) -> bool:
+    """True when the home-channel onboarding prompt must not be sent.
+
+    LOCAL has no deliverable channel, webhooks deliver directly to configured
+    targets (github_comment, etc.), and hub_chat is internal hub<->agent
+    transport with implicit delivery back to the hub -- it has no home-target
+    env var, so /sethome there would write a variable nothing reads.
+    """
+    from gateway.config import Platform
+
+    return (
+        platform == Platform.LOCAL
+        or platform == Platform.WEBHOOK
+        or platform.value == "hub_chat"
+    )
+
+
 _ensure_ssl_certs()
 
 # Add parent directory to path
@@ -5949,7 +5966,8 @@ class GatewayRunner:
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # Skip for hub_chat - internal hub<->agent transport with implicit delivery back to the hub
+        if not history and source.platform and not _home_prompt_exempt(source.platform):
             platform_name = source.platform.value
             env_key = _home_target_env_var(platform_name)
             if not os.getenv(env_key):
