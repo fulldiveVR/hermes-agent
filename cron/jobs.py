@@ -13,7 +13,7 @@ import threading
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Union
@@ -303,13 +303,11 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         minutes = schedule["minutes"]
         if last_run_at:
             # Next run is last_run + interval
-            base = _ensure_aware(datetime.fromisoformat(last_run_at))
+            last = _ensure_aware(datetime.fromisoformat(last_run_at))
+            next_run = last + timedelta(minutes=minutes)
         else:
             # First run is now + interval
-            base = now
-        next_run = (
-            base.astimezone(timezone.utc) + timedelta(minutes=minutes)
-        ).astimezone(base.tzinfo)
+            next_run = now + timedelta(minutes=minutes)
         return next_run.isoformat()
 
     elif schedule["kind"] == "cron":
@@ -334,47 +332,6 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         return next_run.isoformat()
 
     return None
-
-
-def _next_future_recurring_run(
-    schedule: Dict[str, Any],
-    scheduled_at: str,
-    now: datetime,
-    *,
-    consume_scheduled_slot: bool,
-) -> Optional[str]:
-    """Advance a recurring schedule from its persisted cadence.
-
-    ``scheduled_at`` is a schedule slot, not an execution timestamp.  Keeping
-    that distinction prevents ticker latency and run duration from shifting an
-    interval schedule.  Missed or occupied slots are skipped without creating
-    a catch-up burst.
-    """
-    scheduled_dt = _ensure_aware(datetime.fromisoformat(scheduled_at))
-
-    if schedule.get("kind") == "interval":
-        period = timedelta(minutes=schedule.get("minutes", 0))
-        if period.total_seconds() <= 0:
-            return None
-        scheduled_utc = scheduled_dt.astimezone(timezone.utc)
-        now_utc = now.astimezone(timezone.utc)
-        candidate_utc = scheduled_utc + period if consume_scheduled_slot else scheduled_utc
-        if candidate_utc <= now_utc:
-            elapsed = (now_utc - candidate_utc).total_seconds()
-            skipped = int(elapsed // period.total_seconds()) + 1
-            candidate_utc += skipped * period
-        return candidate_utc.astimezone(scheduled_dt.tzinfo).isoformat()
-
-    candidate = scheduled_at
-    if consume_scheduled_slot:
-        candidate = compute_next_run(schedule, candidate)
-
-    if not candidate:
-        return None
-    candidate_dt = _ensure_aware(datetime.fromisoformat(candidate))
-    if candidate_dt.astimezone(timezone.utc) > now.astimezone(timezone.utc):
-        return candidate
-    return compute_next_run(schedule, now.isoformat())
 
 
 # =============================================================================
@@ -629,14 +586,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
 
-        for transient_field in (
-            "automatic_next_run_at",
-            "run_scheduled_at",
-            "manual_restore_state",
-        ):
-            if transient_field in updates and updates[transient_field] is None:
-                updated.pop(transient_field, None)
-
         if "skills" in updates or "skill" in updates:
             normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
             updated["skills"] = normalized_skills
@@ -656,7 +605,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             )
             if updated.get("state") != "paused":
                 updated["next_run_at"] = compute_next_run(updated_schedule)
-            updated.pop("automatic_next_run_at", None)
 
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])
@@ -695,9 +643,6 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": next_run_at,
-            "automatic_next_run_at": None,
-            "run_scheduled_at": None,
-            "manual_restore_state": None,
         },
     )
 
@@ -707,27 +652,16 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     job = get_job(job_id)
     if not job:
         return None
-    updates = {
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
-        "next_run_at": _hermes_now().isoformat(),
-    }
-    if not job.get("enabled", True):
-        updates["manual_restore_state"] = job.get("manual_restore_state") or {
-            "enabled": False,
-            "state": job.get("state"),
-            "paused_at": job.get("paused_at"),
-            "paused_reason": job.get("paused_reason"),
-        }
-    if job.get("schedule", {}).get("kind") in ("cron", "interval"):
-        # A manual run is additional work. Preserve the next automatic slot so
-        # claiming this run cannot move the recurring schedule's cadence.
-        automatic_next = job.get("automatic_next_run_at") or job.get("next_run_at")
-        if automatic_next:
-            updates["automatic_next_run_at"] = automatic_next
-    return update_job(job_id, updates)
+    return update_job(
+        job_id,
+        {
+            "enabled": True,
+            "state": "scheduled",
+            "paused_at": None,
+            "paused_reason": None,
+            "next_run_at": _hermes_now().isoformat(),
+        },
+    )
 
 
 def remove_job(job_id: str) -> bool:
@@ -776,24 +710,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                kind = job.get("schedule", {}).get("kind")
-                claimed_slot = job.pop("run_scheduled_at", None)
-                manual_restore = job.pop("manual_restore_state", None)
-                if kind in ("cron", "interval") and claimed_slot:
-                    next_run = job.get("next_run_at")
-                    if next_run:
-                        job["next_run_at"] = _next_future_recurring_run(
-                            job["schedule"],
-                            next_run,
-                            _ensure_aware(datetime.fromisoformat(now)),
-                            consume_scheduled_slot=False,
-                        )
-                    else:
-                        job["next_run_at"] = None
-                else:
-                    # Compatibility for callers that mark a run without first
-                    # claiming it through advance_next_run().
-                    job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run
+                job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -802,6 +720,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # missing runtime dep into "job completed" and the user's
                 # schedule quietly goes off. See issue #16265.
                 if job["next_run_at"] is None:
+                    kind = job.get("schedule", {}).get("kind")
                     if kind in ("cron", "interval"):
                         job["state"] = "error"
                         if not job.get("last_error"):
@@ -822,12 +741,6 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                 elif job.get("state") != "paused":
                     job["state"] = "scheduled"
-
-                if manual_restore:
-                    job["enabled"] = manual_restore["enabled"]
-                    job["state"] = manual_restore["state"]
-                    job["paused_at"] = manual_restore["paused_at"]
-                    job["paused_reason"] = manual_restore["paused_reason"]
 
                 save_jobs(jobs)
                 return
@@ -854,48 +767,23 @@ def advance_next_run(job_id: str) -> bool:
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in ("cron", "interval"):
                     return False
-                scheduled_at = job.get("next_run_at")
-                if not scheduled_at:
-                    return False
-
-                now = _hermes_now()
-                scheduled_dt = _ensure_aware(datetime.fromisoformat(scheduled_at))
-                if scheduled_dt.astimezone(timezone.utc) > now.astimezone(timezone.utc):
-                    return False
-                automatic_next = job.pop("automatic_next_run_at", None)
-                if automatic_next:
-                    new_next = _next_future_recurring_run(
-                        job["schedule"],
-                        automatic_next,
-                        now,
-                        consume_scheduled_slot=False,
-                    )
-                else:
-                    new_next = _next_future_recurring_run(
-                        job["schedule"],
-                        scheduled_at,
-                        now,
-                        consume_scheduled_slot=True,
-                    )
-
-                if not new_next:
-                    return False
-
-                # Persist the claim together with the future slot. A crash
-                # after this save cannot cause the consumed slot to re-fire.
-                job["run_scheduled_at"] = scheduled_at
-                job["next_run_at"] = new_next
-                save_jobs(jobs)
-                return True
+                now = _hermes_now().isoformat()
+                new_next = compute_next_run(job["schedule"], now)
+                if new_next and new_next != job.get("next_run_at"):
+                    job["next_run_at"] = new_next
+                    save_jobs(jobs)
+                    return True
+                return False
         return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
-    Interval jobs run once after downtime, then advance to their next future
-    cadence slot before execution. Cron-expression jobs retain their bounded
-    catch-up window. Neither schedule type emits a burst of missed runs.
+    For recurring jobs (cron/interval), if the scheduled time is stale
+    (more than one period in the past, e.g. because the gateway was down),
+    the job is fast-forwarded to the next future run instead of firing
+    immediately.  This prevents a burst of missed jobs on gateway restart.
     """
     now = _hermes_now()
     raw_jobs = load_jobs()
@@ -931,16 +819,15 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                     break
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
-        next_run_utc = next_run_dt.astimezone(timezone.utc)
-        now_utc = now.astimezone(timezone.utc)
-        if next_run_utc <= now_utc:
+        if next_run_dt <= now:
             schedule = job.get("schedule", {})
             kind = schedule.get("kind")
 
-            # Cron expressions use a bounded recovery window. Intervals always
-            # run once after downtime and are advanced before execution.
+            # For recurring jobs, check if the scheduled time is stale
+            # (gateway was down and missed the window). Fast-forward to
+            # the next future occurrence instead of firing a stale run.
             grace = _compute_grace_seconds(schedule)
-            if kind == "cron" and (now_utc - next_run_utc).total_seconds() > grace:
+            if kind in ("cron", "interval") and (now - next_run_dt).total_seconds() > grace:
                 # Job is past its catch-up grace window — this is a stale missed run.
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
                 new_next = compute_next_run(schedule, now.isoformat())
