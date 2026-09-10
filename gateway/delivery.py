@@ -9,6 +9,7 @@ Routes messages to the appropriate destination based on:
 """
 
 import logging
+import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
@@ -20,6 +21,32 @@ logger = logging.getLogger(__name__)
 
 MAX_PLATFORM_OUTPUT = 4000
 TRUNCATED_VISIBLE = 3800
+
+# Transports that render A2UI surfaces. Everywhere else an A2UI block is raw
+# JSON in the user's face, so it is stripped before sending.
+A2UI_PLATFORMS = {"hub_chat"}
+
+# Transports with no message-size limit of their own. hub_chat is the internal
+# hub<->agent bridge (rooms, A2A peers); capping it to a messenger-sized
+# payload only mangles otherwise deliverable output.
+UNCAPPED_PLATFORMS = {"hub_chat"}
+
+# An A2UI block, including one left unterminated by an earlier truncation.
+_A2UI_BLOCK_RE = re.compile(
+    r"```(?:application/a2ui\+json|a2ui)[^\n]*\n.*?(?:```|\Z)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+A2UI_OMITTED_NOTE = "[interactive card omitted: this chat cannot render it]"
+
+
+def strip_a2ui_blocks(content: str) -> str:
+    """Drop A2UI blocks from *content* for transports that cannot render them."""
+    stripped = _A2UI_BLOCK_RE.sub("", content)
+    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
+    if not stripped and content.strip():
+        return A2UI_OMITTED_NOTE
+    return stripped
 
 from .config import Platform, GatewayConfig
 from .session import SessionSource
@@ -236,8 +263,13 @@ class DeliveryRouter:
         if not target.chat_id:
             raise ValueError(f"No chat ID for {target.platform.value} delivery")
         
+        # A2UI is only meaningful on transports that render it; elsewhere the
+        # block would arrive as raw JSON (and, once truncated, as broken JSON).
+        if target.platform.value not in A2UI_PLATFORMS:
+            content = strip_a2ui_blocks(content)
+
         # Guard: truncate oversized cron output to stay within platform limits
-        if len(content) > MAX_PLATFORM_OUTPUT:
+        if target.platform.value not in UNCAPPED_PLATFORMS and len(content) > MAX_PLATFORM_OUTPUT:
             job_id = (metadata or {}).get("job_id", "unknown")
             saved_path = self._save_full_output(content, job_id)
             logger.info("Cron output truncated (%d chars) — full output: %s", len(content), saved_path)

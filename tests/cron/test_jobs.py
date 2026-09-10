@@ -5,6 +5,7 @@ import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from cron.jobs import (
     parse_duration,
@@ -18,6 +19,7 @@ from cron.jobs import (
     update_job,
     pause_job,
     resume_job,
+    trigger_job,
     remove_job,
     mark_job_run,
     advance_next_run,
@@ -455,6 +457,207 @@ class TestMarkJobRun:
 class TestAdvanceNextRun:
     """Tests for advance_next_run() — crash-safety for recurring jobs."""
 
+    def test_interval_keeps_phase_after_late_pickup_and_completion(self, tmp_cron_dir, monkeypatch):
+        """A late ticker and run duration must not shift an interval schedule."""
+        job = create_job(prompt="Phase check", schedule="every 2m")
+        first_slot = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = first_slot.isoformat()
+        save_jobs(jobs)
+
+        clock = [first_slot + timedelta(seconds=55)]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        assert advance_next_run(job["id"]) is True
+
+        clock[0] = first_slot + timedelta(minutes=1, seconds=5)
+        mark_job_run(job["id"], success=True)
+
+        assert get_job(job["id"])["next_run_at"] == (
+            first_slot + timedelta(minutes=2)
+        ).isoformat()
+
+    def test_interval_runs_once_after_downtime_then_resumes_next_future_slot(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A missed interval produces one recovery run, never a catch-up burst."""
+        first_slot = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        now = first_slot + timedelta(minutes=31)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(prompt="Recover", schedule="every 5m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = first_slot.isoformat()
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [item["id"] for item in due] == [job["id"]]
+
+        assert advance_next_run(job["id"]) is True
+        assert get_job(job["id"])["next_run_at"] == (
+            first_slot + timedelta(minutes=35)
+        ).isoformat()
+        assert get_due_jobs() == []
+
+    def test_interval_long_run_skips_occupied_slots_without_burst(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Completion after several slots keeps phase and selects one future slot."""
+        first_slot = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        clock = [first_slot]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+
+        job = create_job(prompt="Slow", schedule="every 5m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = first_slot.isoformat()
+        save_jobs(jobs)
+
+        assert advance_next_run(job["id"]) is True
+        assert get_job(job["id"])["next_run_at"] == (
+            first_slot + timedelta(minutes=5)
+        ).isoformat()
+
+        clock[0] = first_slot + timedelta(minutes=17)
+        mark_job_run(job["id"], success=True)
+
+        assert get_job(job["id"])["next_run_at"] == (
+            first_slot + timedelta(minutes=20)
+        ).isoformat()
+        assert get_due_jobs() == []
+
+    def test_manual_interval_run_does_not_shift_automatic_schedule(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Run-now is additional work and leaves the interval cadence unchanged."""
+        scheduled_slot = datetime(2026, 9, 10, 12, 10, tzinfo=timezone.utc)
+        clock = [scheduled_slot - timedelta(minutes=7)]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+
+        job = create_job(prompt="Extra", schedule="every 10m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = scheduled_slot.isoformat()
+        save_jobs(jobs)
+
+        triggered = trigger_job(job["id"])
+        assert triggered["next_run_at"] == clock[0].isoformat()
+        assert advance_next_run(job["id"]) is True
+        assert get_job(job["id"])["next_run_at"] == scheduled_slot.isoformat()
+
+        clock[0] = scheduled_slot + timedelta(minutes=17)
+        mark_job_run(job["id"], success=True)
+        assert get_job(job["id"])["next_run_at"] == (
+            scheduled_slot + timedelta(minutes=20)
+        ).isoformat()
+
+    def test_future_interval_slot_is_not_consumed(self, tmp_cron_dir, monkeypatch):
+        """Claiming is a no-op until the persisted slot is actually due."""
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Future", schedule="every 10m")
+        before = get_job(job["id"])
+
+        assert advance_next_run(job["id"]) is False
+        assert get_job(job["id"]) == before
+
+    def test_interval_slot_is_consumed_at_exact_scheduled_time(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """A slot equal to now is due and advances by exactly one interval."""
+        slot = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: slot)
+        job = create_job(prompt="Exact", schedule="every 10m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = slot.isoformat()
+        save_jobs(jobs)
+
+        assert advance_next_run(job["id"]) is True
+        assert get_job(job["id"])["next_run_at"] == (
+            slot + timedelta(minutes=10)
+        ).isoformat()
+
+    def test_schedule_update_during_run_preserves_new_cadence(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Completion cannot overwrite a schedule edited while a run is active."""
+        first_slot = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        clock = [first_slot]
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: clock[0])
+        job = create_job(prompt="Editable", schedule="every 5m")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = first_slot.isoformat()
+        save_jobs(jobs)
+
+        assert advance_next_run(job["id"]) is True
+        clock[0] = first_slot + timedelta(minutes=1)
+        updated = update_job(job["id"], {"schedule": parse_schedule("every 10m")})
+        assert updated["next_run_at"] == (
+            first_slot + timedelta(minutes=11)
+        ).isoformat()
+
+        clock[0] = first_slot + timedelta(minutes=2)
+        mark_job_run(job["id"], success=True)
+        assert get_job(job["id"])["next_run_at"] == (
+            first_slot + timedelta(minutes=11)
+        ).isoformat()
+
+    def test_interval_uses_elapsed_time_across_dst_fall_back(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """Hourly intervals represent 60 elapsed minutes, including a repeated hour."""
+        eastern = ZoneInfo("America/New_York")
+        first_slot = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=0)
+        now = datetime(2026, 11, 1, 1, 45, tzinfo=eastern, fold=0)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="DST", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = first_slot.isoformat()
+        save_jobs(jobs)
+
+        assert advance_next_run(job["id"]) is True
+        expected = datetime(2026, 11, 1, 1, 30, tzinfo=eastern, fold=1)
+        assert get_job(job["id"])["next_run_at"] == expected.isoformat()
+        assert advance_next_run(job["id"]) is False
+
+    @pytest.mark.parametrize(
+        ("enabled", "state", "paused_at", "paused_reason"),
+        [
+            (False, "paused", "2026-09-10T11:00:00+00:00", "user paused"),
+            (False, "disabled", None, None),
+        ],
+    )
+    def test_manual_run_restores_disabled_recurring_state(
+        self,
+        tmp_cron_dir,
+        monkeypatch,
+        enabled,
+        state,
+        paused_at,
+        paused_reason,
+    ):
+        """Run-now executes disabled jobs once without enabling their cadence."""
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="One extra run", schedule="every 10m")
+        jobs = load_jobs()
+        jobs[0].update(
+            enabled=enabled,
+            state=state,
+            paused_at=paused_at,
+            paused_reason=paused_reason,
+        )
+        save_jobs(jobs)
+
+        triggered = trigger_job(job["id"])
+        assert triggered["enabled"] is True
+        assert advance_next_run(job["id"]) is True
+        mark_job_run(job["id"], success=True)
+
+        restored = get_job(job["id"])
+        assert restored["enabled"] is False
+        assert restored["state"] == state
+        assert restored["paused_at"] == paused_at
+        assert restored["paused_reason"] == paused_reason
+        assert get_due_jobs() == []
+
     def test_advances_interval_job(self, tmp_cron_dir):
         """Interval jobs should have next_run_at bumped to the next future occurrence."""
         job = create_job(prompt="Recurring check", schedule="every 1h")
@@ -552,12 +755,13 @@ class TestGetDueJobs:
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
 
-    def test_stale_past_due_skipped(self, tmp_cron_dir):
-        """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
+    def test_stale_cron_expression_past_due_skipped(self, tmp_cron_dir):
+        """Cron expressions past their grace window are fast-forwarded, not fired.
 
         For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
         """
-        job = create_job(prompt="Stale", schedule="every 1h")
+        pytest.importorskip("croniter")
+        job = create_job(prompt="Stale", schedule="0 * * * *")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
